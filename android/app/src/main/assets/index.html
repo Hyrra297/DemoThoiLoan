@@ -1,0 +1,969 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>ThoiLoan Battle Demo</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #1a1a2e;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+    font-family: 'Arial', sans-serif;
+    overflow: hidden;
+    touch-action: none;
+  }
+  #gameWrapper {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+  #gameCanvas {
+    display: block;
+    cursor: crosshair;
+    border: 2px solid #4a90d9;
+    box-shadow: 0 0 30px rgba(74,144,217,0.5);
+  }
+  #ui {
+    width: 100%;
+    background: linear-gradient(180deg, #2c1810 0%, #1a0e08 100%);
+    border-top: 3px solid #8b6914;
+    display: flex;
+    align-items: center;
+    padding: 6px 10px;
+    gap: 8px;
+    flex-shrink: 0;
+  }
+  .troop-btn {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    background: linear-gradient(180deg, #5a3a10 0%, #3a2008 100%);
+    border: 2px solid #8b6914;
+    border-radius: 8px;
+    padding: 4px 6px;
+    cursor: pointer;
+    min-width: 60px;
+    transition: all 0.15s;
+    user-select: none;
+  }
+  .troop-btn:hover { border-color: #ffd700; transform: scale(1.05); }
+  .troop-btn.selected { border-color: #ffd700; background: linear-gradient(180deg, #7a5020 0%, #5a3010 100%); box-shadow: 0 0 10px rgba(255,215,0,0.5); }
+  .troop-icon { width: 38px; height: 38px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 20px; }
+  .troop-label { color: #ffd700; font-size: 9px; font-weight: bold; margin-top: 2px; }
+  .troop-count { color: #fff; font-size: 11px; font-weight: bold; }
+  #battleInfo {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    color: #ffd700;
+    font-weight: bold;
+    font-size: 13px;
+    gap: 2px;
+  }
+  #timer { font-size: 22px; color: #ff6b6b; }
+  #percent { font-size: 14px; color: #4CAF50; }
+  #btnStart {
+    background: linear-gradient(180deg, #ff8c00 0%, #cc5500 100%);
+    border: 2px solid #ffd700;
+    border-radius: 10px;
+    color: #fff;
+    font-size: 14px;
+    font-weight: bold;
+    padding: 8px 16px;
+    cursor: pointer;
+    box-shadow: 0 0 15px rgba(255,140,0,0.5);
+  }
+  #btnStart:hover { transform: scale(1.05); box-shadow: 0 0 25px rgba(255,140,0,0.8); }
+  #overlay {
+    position: absolute;
+    top: 0; left: 0;
+    width: 100%; height: 100%;
+    background: rgba(0,0,0,0.82);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    z-index: 10;
+    gap: 14px;
+    pointer-events: all;
+  }
+  #overlay h1 { color: #ffd700; font-size: 32px; text-shadow: 0 0 20px rgba(255,215,0,0.8); }
+  #overlay h2 { color: #fff; font-size: 20px; }
+  #overlay p  { color: #ccc; font-size: 13px; text-align: center; max-width: 380px; line-height: 1.6; }
+  .star-row { display: flex; gap: 10px; }
+  .star-box { font-size: 40px; }
+  #btnRestart {
+    background: linear-gradient(180deg, #2196F3 0%, #1565C0 100%);
+    border: 2px solid #90CAF9;
+    border-radius: 12px;
+    color: #fff;
+    font-size: 16px;
+    font-weight: bold;
+    padding: 12px 28px;
+    cursor: pointer;
+    margin-top: 8px;
+  }
+  #btnRestart:hover { transform: scale(1.05); }
+  #instructions { color: #aaa; font-size: 12px; line-height: 1.8; text-align: center; }
+</style>
+</head>
+<body>
+<div id="gameWrapper">
+  <canvas id="gameCanvas"></canvas>
+  <div id="ui">
+    <div class="troop-btn selected" id="btn0" onclick="selectTroop(0)">
+      <div class="troop-icon" style="background:#e74c3c;">⚔️</div>
+      <div class="troop-label">Barbarian</div>
+      <div class="troop-count" id="cnt0">×∞</div>
+    </div>
+    <div class="troop-btn" id="btn1" onclick="selectTroop(1)">
+      <div class="troop-icon" style="background:#27ae60;">🏹</div>
+      <div class="troop-label">Archer</div>
+      <div class="troop-count" id="cnt1">×∞</div>
+    </div>
+    <div class="troop-btn" id="btn2" onclick="selectTroop(2)">
+      <div class="troop-icon" style="background:#3498db;">🛡️</div>
+      <div class="troop-label">Giant</div>
+      <div class="troop-count" id="cnt2">×∞</div>
+    </div>
+    <div class="troop-btn" id="btn3" onclick="selectTroop(3)">
+      <div class="troop-icon" style="background:#9b59b6;">🐉</div>
+      <div class="troop-label">Dragon</div>
+      <div class="troop-count" id="cnt3">×∞</div>
+    </div>
+    <div id="battleInfo">
+      <div>⏱ <span id="timer">3:00</span></div>
+      <div>🏚 Đã phá: <span id="percent">0%</span></div>
+    </div>
+    <button id="btnStart" onclick="startBattle()">⚔️ CHIẾN!</button>
+  </div>
+</div>
+
+<div id="overlay">
+  <h1>⚔️ ThoiLoan Battle</h1>
+  <p id="instructions">
+    <b style="color:#ffd700">Cách chơi:</b><br>
+    1. Chọn quân lính (Barbarian / Archer / Giant / Dragon)<br>
+    2. Nhấp vào khu vực XANH trên bản đồ để thả quân<br>
+    3. Phá hủy nhiều nhất có thể trước khi hết giờ!<br><br>
+    ⭐ 50% → 1 sao &nbsp; ⭐⭐ 70% → 2 sao &nbsp; ⭐⭐⭐ 100% → 3 sao
+  </p>
+  <button id="btnRestart" onclick="initGame()">🎮 BẮT ĐẦU</button>
+</div>
+
+<script>
+// ============================================================
+// CONSTANTS
+// ============================================================
+const TILE    = 36;
+const COLS    = 18;
+const ROWS    = 16;
+const UI_H    = 70;
+const BORDER  = 2;  // deploy zone width (tiles from edge)
+const BATTLE_TIME = 180; // seconds
+
+// ============================================================
+// GAME DATA  (stats from res/json/Troop.json)
+// ============================================================
+const TROOPS_DEF = [
+  { id: 'barbarian', name: 'Barbarian', emoji: '⚔️', color: '#e74c3c',
+    hp: 45,  dps: 8,  speed: 90, range: 0.9, size: 10, isFlying: false, splash: false },
+  { id: 'archer',    name: 'Archer',    emoji: '🏹', color: '#27ae60',
+    hp: 20,  dps: 7,  speed: 100, range: 3.5, size: 9,  isFlying: false, splash: false },
+  { id: 'giant',     name: 'Giant',     emoji: '🛡️', color: '#3498db',
+    hp: 300, dps: 11, speed: 55, range: 0.9, size: 14, isFlying: false, splash: false },
+  { id: 'dragon',    name: 'Dragon',    emoji: '🐉', color: '#9b59b6',
+    hp: 1700,dps: 120,speed: 65, range: 3.5, size: 18, isFlying: true,  splash: true  },
+];
+
+// Building defs: type, name, hp, dps, range (tiles), size (tiles), sprite key
+// (stats approximate based on game JSON data)
+const BUILDINGS_DEF = {
+  cannon:       { name: 'Cannon',       hp: 400,  dps: 40,  range: 5,   size: 2, color: '#7f8c8d', priority: 'ground' },
+  archer_tower: { name: 'Archer Tower', hp: 380,  dps: 30,  range: 6,   size: 2, color: '#e67e22', priority: 'any' },
+  mortar:       { name: 'Mortar',       hp: 500,  dps: 20,  range: 7,   size: 2, color: '#95a5a6', priority: 'ground', splash: true },
+  wizard_tower: { name: 'Wizard Tower', hp: 620,  dps: 60,  range: 5,   size: 2, color: '#8e44ad', priority: 'any',   splash: true },
+  town_hall:    { name: 'Town Hall',    hp: 2800, dps: 0,   range: 0,   size: 4, color: '#c0392b', priority: null },
+};
+
+// Base layout: [type, col, row]
+const BASE_LAYOUT = [
+  ['town_hall',    7,  6],
+  ['cannon',       3,  3],
+  ['cannon',      13,  3],
+  ['cannon',       3, 11],
+  ['cannon',      13, 11],
+  ['archer_tower', 7,  2],
+  ['archer_tower', 7, 12],
+  ['archer_tower', 2,  7],
+  ['archer_tower',14,  7],
+  ['mortar',      10,  5],
+  ['mortar',       5, 10],
+  ['wizard_tower', 9, 10],
+  ['wizard_tower', 5,  5],
+];
+
+// ============================================================
+// A* PATHFINDING
+// ============================================================
+class AStar {
+  constructor(cols, rows) {
+    this.cols = cols;
+    this.rows = rows;
+    this.grid = Array.from({length: rows}, () => new Array(cols).fill(0));
+  }
+  setBlocked(c, r) { if (this.inBounds(c,r)) this.grid[r][c] = 1; }
+  clearBlocked(c, r) { if (this.inBounds(c,r)) this.grid[r][c] = 0; }
+  inBounds(c, r) { return c >= 0 && c < this.cols && r >= 0 && r < this.rows; }
+  h(c, r, gc, gr) { return Math.abs(c - gc) + Math.abs(r - gr); }
+  findPath(sc, sr, gc, gr) {
+    const open = [];
+    const closed = new Set();
+    const g = {}, f = {}, parent = {};
+    const key = (c, r) => c + ',' + r;
+    g[key(sc,sr)] = 0;
+    f[key(sc,sr)] = this.h(sc, sr, gc, gr);
+    open.push({c: sc, r: sr});
+    let iter = 0;
+    while (open.length && iter++ < 500) {
+      open.sort((a, b) => f[key(a.c,a.r)] - f[key(b.c,b.r)]);
+      const cur = open.shift();
+      const ck = key(cur.c, cur.r);
+      if (cur.c === gc && cur.r === gr) {
+        // reconstruct
+        const path = [];
+        let k = ck;
+        while (parent[k]) { const [pc,pr] = parent[k].split(',').map(Number); path.unshift({c:pc,r:pr}); k = parent[k]; }
+        path.push({c: gc, r: gr});
+        return path;
+      }
+      closed.add(ck);
+      const dirs = [{dc:1,dr:0},{dc:-1,dr:0},{dc:0,dr:1},{dc:0,dr:-1}];
+      for (const {dc, dr} of dirs) {
+        const nc = cur.c + dc, nr = cur.r + dr;
+        const nk = key(nc, nr);
+        if (!this.inBounds(nc,nr) || closed.has(nk)) continue;
+        if (this.grid[nr][nc] === 1 && !(nc === gc && nr === gr)) continue;
+        const ng = g[ck] + 1;
+        if (g[nk] === undefined || ng < g[nk]) {
+          g[nk] = ng;
+          f[nk] = ng + this.h(nc, nr, gc, gr);
+          parent[nk] = ck;
+          if (!open.find(n => n.c === nc && n.r === nr)) open.push({c: nc, r: nr});
+        }
+      }
+    }
+    return null;
+  }
+}
+
+// ============================================================
+// ENTITIES
+// ============================================================
+class Building {
+  constructor(type, col, row, def) {
+    this.type   = type;
+    this.def    = def;
+    this.col    = col;
+    this.row    = row;
+    this.size   = def.size;
+    this.maxHp  = def.hp;
+    this.hp     = def.hp;
+    this.dps    = def.dps;
+    this.range  = def.range;
+    this.priority = def.priority;
+    this.splash = def.splash || false;
+    this.dead   = false;
+    this.sprite = null; // loaded later
+    this.cx     = (col + def.size / 2) * TILE;
+    this.cy     = (row + def.size / 2) * TILE;
+    this.fireTimer = 0;
+    this.fireRate  = def.dps > 0 ? (1000 / def.dps * 12) : Infinity; // ms per shot approx
+  }
+}
+
+class Troop {
+  constructor(def, px, py) {
+    this.def    = def;
+    this.hp     = def.hp;
+    this.maxHp  = def.hp;
+    this.dps    = def.dps;
+    this.speed  = def.speed;
+    this.range  = def.range * TILE;
+    this.size   = def.size;
+    this.color  = def.color;
+    this.emoji  = def.emoji;
+    this.isFlying = def.isFlying;
+    this.splash   = def.splash;
+    this.dead   = false;
+    this.x = px; this.y = py;
+    this.vx = 0; this.vy = 0;
+    this.target = null;
+    this.path   = [];
+    this.pathIdx = 0;
+    this.attackTimer = 0;
+    this.attackRate  = 1.0 / (def.dps / 20); // seconds between attacks
+    this.shakeX = 0;
+    this.angle  = 0;
+  }
+}
+
+class Projectile {
+  constructor(x, y, tx, ty, dmg, color, splash, fromBuilding) {
+    this.x = x; this.y = y;
+    this.tx = tx; this.ty = ty;
+    this.dmg = dmg;
+    this.color = color;
+    this.splash = splash;
+    this.fromBuilding = fromBuilding;
+    const dx = tx - x, dy = ty - y;
+    const dist = Math.sqrt(dx*dx + dy*dy) || 1;
+    const spd = 180;
+    this.vx = dx / dist * spd;
+    this.vy = dy / dist * spd;
+    this.dead = false;
+    this.radius = fromBuilding ? 5 : 4;
+  }
+}
+
+class Explosion {
+  constructor(x, y, radius, color) {
+    this.x = x; this.y = y;
+    this.radius = radius;
+    this.maxR = radius;
+    this.color = color;
+    this.alpha = 1;
+    this.dead = false;
+  }
+}
+
+// ============================================================
+// GAME STATE
+// ============================================================
+let canvas, ctx;
+let astar;
+let buildings = [], troops = [], projectiles = [], explosions = [];
+let sprites = {};
+let selectedTroopIdx = 0;
+let gameState = 'ready'; // 'ready' | 'battle' | 'win' | 'lose'
+let timeLeft = BATTLE_TIME;
+let lastTime = 0;
+let timerInterval = null;
+let destroyedCount = 0;
+let totalBuildings = 0;
+let stars = 0;
+let bgColors = { ground: '#5d8a3c', border: '#3a6b20', grid: 'rgba(0,0,0,0.08)' };
+
+// ============================================================
+// SPRITE LOADING
+// ============================================================
+function loadSprites(callback) {
+  const paths = {
+    cannon:       'assets/buildings/cannon.png',
+    archer_tower: 'assets/buildings/archer_tower.png',
+    mortar:       'assets/buildings/mortar.png',
+    wizard_tower: 'assets/buildings/wizard_tower.png',
+    town_hall:    'assets/buildings/town_hall.png',
+    star_on:      'assets/star_on.png',
+    star_off:     'assets/star_off.png',
+  };
+  let loaded = 0, total = Object.keys(paths).length;
+  for (const [key, path] of Object.entries(paths)) {
+    const img = new Image();
+    img.onload  = () => { sprites[key] = img; if (++loaded === total) callback(); };
+    img.onerror = () => { sprites[key] = null; if (++loaded === total) callback(); };
+    img.src = path;
+  }
+}
+
+// ============================================================
+// INIT GAME
+// ============================================================
+function initGame() {
+  document.getElementById('overlay').style.display = 'none';
+  gameState = 'ready';
+  timeLeft  = BATTLE_TIME;
+  troops = []; projectiles = []; explosions = [];
+  destroyedCount = 0;
+
+  // Build pathfinding grid
+  astar = new AStar(COLS, ROWS);
+
+  // Place buildings
+  buildings = [];
+  for (const [type, col, row] of BASE_LAYOUT) {
+    const def = BUILDINGS_DEF[type];
+    const b   = new Building(type, col, row, def);
+    b.sprite  = sprites[type] || null;
+    buildings.push(b);
+    // Block grid cells
+    for (let r = row; r < row + def.size; r++)
+      for (let c = col; c < col + def.size; c++)
+        astar.setBlocked(c, r);
+  }
+  totalBuildings = buildings.length;
+
+  updateTimerDisplay();
+  updatePercentDisplay();
+  render();
+}
+
+// ============================================================
+// TROOP SELECTION
+// ============================================================
+function selectTroop(idx) {
+  selectedTroopIdx = idx;
+  document.querySelectorAll('.troop-btn').forEach((b, i) => {
+    b.classList.toggle('selected', i === idx);
+  });
+}
+
+// ============================================================
+// BATTLE START
+// ============================================================
+function startBattle() {
+  if (gameState !== 'ready') return;
+  gameState = 'battle';
+  document.getElementById('btnStart').textContent = '💀 Đang đánh...';
+  document.getElementById('btnStart').disabled = true;
+  timerInterval = setInterval(() => {
+    if (gameState !== 'battle') { clearInterval(timerInterval); return; }
+    timeLeft--;
+    if (timeLeft <= 0) { timeLeft = 0; endBattle(); }
+    updateTimerDisplay();
+  }, 1000);
+  lastTime = performance.now();
+  requestAnimationFrame(gameLoop);
+}
+
+function updateTimerDisplay() {
+  const m = Math.floor(timeLeft / 60), s = timeLeft % 60;
+  document.getElementById('timer').textContent = `${m}:${s.toString().padStart(2,'0')}`;
+}
+function updatePercentDisplay() {
+  const pct = totalBuildings > 0 ? Math.round(destroyedCount / totalBuildings * 100) : 0;
+  document.getElementById('percent').textContent = pct + '%';
+  return pct;
+}
+
+// ============================================================
+// DEPLOY TROOP
+// ============================================================
+function isBorderTile(c, r) {
+  return c < BORDER || c >= COLS - BORDER || r < BORDER || r >= ROWS - BORDER;
+}
+
+function deployTroop(pixelX, pixelY) {
+  if (gameState !== 'battle') return;
+  const c = Math.floor(pixelX / TILE);
+  const r = Math.floor(pixelY / TILE);
+  if (c < 0 || c >= COLS || r < 0 || r >= ROWS) return;
+  if (!isBorderTile(c, r)) return;
+  if (astar.grid[r][c] === 1) return;
+
+  const def = TROOPS_DEF[selectedTroopIdx];
+  const t = new Troop(def, c * TILE + TILE/2, r * TILE + TILE/2);
+  troops.push(t);
+}
+
+// ============================================================
+// GAME LOOP
+// ============================================================
+function gameLoop(now) {
+  if (gameState !== 'battle') return;
+  const dt = Math.min((now - lastTime) / 1000, 0.05);
+  lastTime = now;
+  update(dt);
+  render();
+  requestAnimationFrame(gameLoop);
+}
+
+function update(dt) {
+  updateTroops(dt);
+  updateBuildings(dt);
+  updateProjectiles(dt);
+  updateExplosions(dt);
+  // Check all buildings dead
+  const alive = buildings.filter(b => !b.dead);
+  if (alive.length === 0 && buildings.length > 0) endBattle();
+}
+
+// ---- TROOPS ----
+function updateTroops(dt) {
+  for (const t of troops) {
+    if (t.dead) continue;
+
+    // Find target
+    if (!t.target || t.target.dead) {
+      t.target = findTarget(t);
+      t.path = [];
+      t.pathIdx = 0;
+    }
+    if (!t.target) continue;
+
+    const tb = t.target;
+    const dx = tb.cx - t.x, dy = tb.cy - t.y;
+    const dist = Math.sqrt(dx*dx + dy*dy);
+
+    if (dist <= t.range + tb.size * TILE / 2) {
+      // Attack
+      t.vx = 0; t.vy = 0;
+      t.attackTimer -= dt;
+      if (t.attackTimer <= 0) {
+        t.attackTimer = t.attackRate;
+        // shoot projectile
+        const clr = t.def.color;
+        const proj = new Projectile(t.x, t.y, tb.cx, tb.cy,
+          t.dps * t.attackRate, clr, t.splash, false);
+        projectiles.push(proj);
+      }
+    } else {
+      // Move with pathfinding (ground only)
+      if (t.isFlying) {
+        const spd = t.speed / 60;
+        t.vx = dx / dist * spd;
+        t.vy = dy / dist * spd;
+      } else {
+        // Recompute path periodically
+        if (t.path.length === 0 || t.pathIdx >= t.path.length) {
+          const sc = Math.floor(t.x / TILE);
+          const sr = Math.floor(t.y / TILE);
+          const gc = tb.col + Math.floor(tb.size / 2);
+          const gr = tb.row + Math.floor(tb.size / 2);
+          // find nearest walkable to building
+          const gAlt = findNearestWalkable(gc, gr, t);
+          t.path = astar.findPath(sc, sr, gAlt.c, gAlt.r) || [];
+          t.pathIdx = 0;
+        }
+        if (t.path.length > 0 && t.pathIdx < t.path.length) {
+          const next = t.path[t.pathIdx];
+          const nx = next.c * TILE + TILE/2;
+          const ny = next.r * TILE + TILE/2;
+          const ndx = nx - t.x, ndy = ny - t.y;
+          const nd = Math.sqrt(ndx*ndx + ndy*ndy);
+          if (nd < 4) { t.pathIdx++; }
+          else {
+            const spd = t.speed / 60;
+            t.vx = ndx / nd * spd;
+            t.vy = ndy / nd * spd;
+          }
+        }
+      }
+      t.x += t.vx * dt * 60;
+      t.y += t.vy * dt * 60;
+      t.angle = Math.atan2(t.vy, t.vx);
+    }
+    // Clamp to canvas
+    t.x = Math.max(t.size, Math.min(COLS*TILE - t.size, t.x));
+    t.y = Math.max(t.size, Math.min(ROWS*TILE - t.size, t.y));
+  }
+}
+
+function findTarget(troop) {
+  let closest = null, minDist = Infinity;
+  for (const b of buildings) {
+    if (b.dead) continue;
+    if (b.priority === 'ground' && troop.isFlying) continue;
+    const dx = b.cx - troop.x, dy = b.cy - troop.y;
+    const d = Math.sqrt(dx*dx+dy*dy);
+    if (d < minDist) { minDist = d; closest = b; }
+  }
+  return closest;
+}
+
+function findNearestWalkable(gc, gr, troop) {
+  // BFS outward from building center to find walkable tile
+  const queue = [{c: gc, r: gr}];
+  const seen = new Set([gc+','+gr]);
+  let iter = 0;
+  while (queue.length && iter++ < 60) {
+    const cur = queue.shift();
+    if (astar.grid[cur.r] && astar.grid[cur.r][cur.c] === 0) return cur;
+    for (const {dc,dr} of [{dc:1,dr:0},{dc:-1,dr:0},{dc:0,dr:1},{dc:0,dr:-1}]) {
+      const nc = cur.c+dc, nr = cur.r+dr;
+      const k = nc+','+nr;
+      if (!seen.has(k) && nc>=0&&nc<COLS&&nr>=0&&nr<ROWS) { seen.add(k); queue.push({c:nc,r:nr}); }
+    }
+  }
+  return {c: gc, r: gr};
+}
+
+// ---- BUILDINGS ----
+function updateBuildings(dt) {
+  for (const b of buildings) {
+    if (b.dead || b.dps <= 0) continue;
+    b.fireTimer -= dt * 1000;
+    if (b.fireTimer > 0) continue;
+
+    // Find troop target
+    let targetTroop = null, minDist = Infinity;
+    for (const t of troops) {
+      if (t.dead) continue;
+      if (b.priority === 'ground' && t.isFlying) continue;
+      const dx = t.x - b.cx, dy = t.y - b.cy;
+      const d = Math.sqrt(dx*dx+dy*dy);
+      if (d <= b.range * TILE && d < minDist) { minDist = d; targetTroop = t; }
+    }
+    if (!targetTroop) continue;
+
+    b.fireTimer = b.fireRate;
+    const clr = b.def.color;
+    const proj = new Projectile(b.cx, b.cy, targetTroop.x, targetTroop.y,
+      b.dps / 3, clr, b.splash, true);
+    projectiles.push(proj);
+  }
+}
+
+// ---- PROJECTILES ----
+function updateProjectiles(dt) {
+  for (const p of projectiles) {
+    if (p.dead) continue;
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+    const dx = p.x - p.tx, dy = p.y - p.ty;
+    if (dx*dx + dy*dy < 100) {
+      p.dead = true;
+      // Hit
+      if (p.fromBuilding) {
+        // Damage troops
+        if (p.splash) {
+          for (const t of troops) { if (!t.dead) { const d=Math.hypot(t.x-p.tx,t.y-p.ty); if(d<TILE*2) applyTroopDamage(t, p.dmg * (1-d/(TILE*2.5))); } }
+          explosions.push(new Explosion(p.tx, p.ty, TILE*2, p.color));
+        } else {
+          for (const t of troops) { if (!t.dead && Math.hypot(t.x-p.tx,t.y-p.ty) < TILE) applyTroopDamage(t, p.dmg); }
+          explosions.push(new Explosion(p.tx, p.ty, TILE*0.7, p.color));
+        }
+      } else {
+        // Damage buildings
+        if (p.splash) {
+          for (const b of buildings) { if (!b.dead) { const d=Math.hypot(b.cx-p.tx,b.cy-p.ty); if(d<TILE*2.5) applyBuildingDamage(b, p.dmg*(1-d/(TILE*3))); } }
+          explosions.push(new Explosion(p.tx, p.ty, TILE*2, p.color));
+        } else {
+          for (const b of buildings) { if (!b.dead && Math.hypot(b.cx-p.tx,b.cy-p.ty) < TILE*b.size/2+10) applyBuildingDamage(b, p.dmg); }
+          explosions.push(new Explosion(p.tx, p.ty, TILE*0.6, p.color));
+        }
+      }
+    }
+  }
+  projectiles = projectiles.filter(p => !p.dead || p.dead);
+}
+
+function applyTroopDamage(t, dmg) {
+  t.hp -= dmg;
+  t.shakeX = 3;
+  if (t.hp <= 0) {
+    t.dead = true;
+    explosions.push(new Explosion(t.x, t.y, TILE, '#ff6b6b'));
+  }
+}
+
+function applyBuildingDamage(b, dmg) {
+  if (b.dead) return;
+  b.hp -= dmg;
+  if (b.hp <= 0) {
+    b.hp = 0;
+    b.dead = true;
+    destroyedCount++;
+    // Unblock grid
+    for (let r = b.row; r < b.row+b.size; r++)
+      for (let c = b.col; c < b.col+b.size; c++)
+        astar.clearBlocked(c, r);
+    explosions.push(new Explosion(b.cx, b.cy, TILE * b.size * 1.2, '#ff4500'));
+    // Clear paths
+    for (const t of troops) { t.path = []; t.pathIdx = 0; }
+    updatePercentDisplay();
+  }
+}
+
+function updateExplosions(dt) {
+  for (const e of explosions) {
+    e.alpha -= dt * 2.5;
+    e.radius += dt * 30;
+    if (e.alpha <= 0) e.dead = true;
+  }
+}
+
+// ============================================================
+// END BATTLE
+// ============================================================
+function endBattle() {
+  if (gameState !== 'battle') return;
+  gameState = 'over';
+  clearInterval(timerInterval);
+  const pct = updatePercentDisplay();
+  stars = pct >= 100 ? 3 : pct >= 70 ? 2 : pct >= 50 ? 1 : 0;
+  showEndOverlay(pct, stars);
+}
+
+function showEndOverlay(pct, stars) {
+  const ov = document.getElementById('overlay');
+  ov.style.display = 'flex';
+  const title = pct >= 70 ? '🎉 CHIẾN THẮNG!' : '💀 THẤT BẠI!';
+  const starRow = [1,2,3].map(i =>
+    `<div class="star-box">${i <= stars ? '⭐' : '☆'}</div>`
+  ).join('');
+  ov.innerHTML = `
+    <h1>${title}</h1>
+    <div class="star-row">${starRow}</div>
+    <h2>${pct}% phá hủy</h2>
+    <p>${stars === 3 ? 'Hoàn hảo! Tất cả công trình bị tiêu diệt!' :
+        stars === 2 ? 'Tốt lắm! Phá được phần lớn phòng thủ!' :
+        stars === 1 ? 'Đạt yêu cầu tối thiểu. Cần cải thiện chiến thuật!' :
+        'Thua rồi! Hãy chọn quân phù hợp và chiến thuật tốt hơn!'}</p>
+    <button id="btnRestart" onclick="initGame()">🔄 CHƠI LẠI</button>
+  `;
+}
+
+// ============================================================
+// RENDERER
+// ============================================================
+function render() {
+  const W = COLS * TILE, H = ROWS * TILE;
+  ctx.clearRect(0, 0, W, H);
+
+  renderMap();
+  renderExplosions();
+  renderBuildings();
+  renderTroops();
+  renderProjectiles();
+  renderRangeIndicator();
+}
+
+function renderMap() {
+  const W = COLS * TILE, H = ROWS * TILE;
+  // Ground
+  const grad = ctx.createLinearGradient(0,0,W,H);
+  grad.addColorStop(0, '#4a7c2f');
+  grad.addColorStop(1, '#5a8a3a');
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, W, H);
+
+  // Border/deploy zone
+  ctx.fillStyle = 'rgba(100,200,100,0.18)';
+  for (let c = 0; c < COLS; c++) for (let r = 0; r < ROWS; r++) {
+    if (isBorderTile(c, r)) ctx.fillRect(c*TILE, r*TILE, TILE, TILE);
+  }
+
+  // Grid lines
+  ctx.strokeStyle = 'rgba(0,0,0,0.12)';
+  ctx.lineWidth = 0.5;
+  for (let c = 0; c <= COLS; c++) { ctx.beginPath(); ctx.moveTo(c*TILE,0); ctx.lineTo(c*TILE,H); ctx.stroke(); }
+  for (let r = 0; r <= ROWS; r++) { ctx.beginPath(); ctx.moveTo(0,r*TILE); ctx.lineTo(W,r*TILE); ctx.stroke(); }
+
+  // Deploy hint (only in battle)
+  if (gameState === 'battle') {
+    ctx.strokeStyle = '#00ff88';
+    ctx.lineWidth = 2.5;
+    ctx.setLineDash([6, 4]);
+    ctx.strokeRect(BORDER*TILE, BORDER*TILE, (COLS-BORDER*2)*TILE, (ROWS-BORDER*2)*TILE);
+    ctx.setLineDash([]);
+  }
+}
+
+function renderBuildings() {
+  for (const b of buildings) {
+    if (b.dead) continue;
+    const bx = b.col * TILE, by = b.row * TILE;
+    const bw = b.size * TILE, bh = b.size * TILE;
+
+    // Shadow
+    ctx.fillStyle = 'rgba(0,0,0,0.3)';
+    ctx.beginPath();
+    ctx.ellipse(b.cx, by + bh + 4, bw*0.45, 7, 0, 0, Math.PI*2);
+    ctx.fill();
+
+    if (b.sprite) {
+      // Draw sprite, centered, scaled to fit tile
+      const scale = Math.min(bw / b.sprite.naturalWidth, bh / b.sprite.naturalHeight) * 1.1;
+      const sw = b.sprite.naturalWidth * scale, sh = b.sprite.naturalHeight * scale;
+      try { ctx.drawImage(b.sprite, b.cx - sw/2, b.cy - sh/2, sw, sh); }
+      catch(e) { drawBuildingFallback(b, bx, by, bw, bh); }
+    } else {
+      drawBuildingFallback(b, bx, by, bw, bh);
+    }
+
+    // HP bar
+    const barW = bw * 0.85, barH = 5;
+    const bpct = b.hp / b.maxHp;
+    ctx.fillStyle = '#333';
+    ctx.fillRect(b.cx - barW/2, by - 10, barW, barH);
+    ctx.fillStyle = bpct > 0.5 ? '#4CAF50' : bpct > 0.25 ? '#ff9800' : '#f44336';
+    ctx.fillRect(b.cx - barW/2, by - 10, barW * bpct, barH);
+    ctx.strokeStyle = '#222';
+    ctx.lineWidth = 0.5;
+    ctx.strokeRect(b.cx - barW/2, by - 10, barW, barH);
+
+    // Label
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 8px Arial';
+    ctx.textAlign = 'center';
+    ctx.fillText(b.def.name, b.cx, by - 13);
+  }
+}
+
+function drawBuildingFallback(b, bx, by, bw, bh) {
+  ctx.fillStyle = b.def.color;
+  ctx.fillRect(bx+3, by+3, bw-6, bh-6);
+  ctx.strokeStyle = '#000';
+  ctx.lineWidth = 1.5;
+  ctx.strokeRect(bx+3, by+3, bw-6, bh-6);
+  ctx.fillStyle = '#fff';
+  ctx.font = `bold ${Math.floor(bw*0.4)}px Arial`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  const em = {cannon:'💣',archer_tower:'🗼',mortar:'🔥',wizard_tower:'🧙',town_hall:'🏰'};
+  ctx.fillText(em[b.type] || '🏗', b.cx, b.cy);
+  ctx.textBaseline = 'alphabetic';
+}
+
+function renderTroops() {
+  for (const t of troops) {
+    if (t.dead) continue;
+
+    ctx.save();
+    ctx.translate(t.x + t.shakeX, t.y);
+    t.shakeX *= 0.7;
+
+    // Shadow
+    ctx.fillStyle = 'rgba(0,0,0,0.3)';
+    ctx.beginPath();
+    ctx.ellipse(0, t.size * 0.7, t.size * 0.7, t.size * 0.25, 0, 0, Math.PI*2);
+    ctx.fill();
+
+    // Body circle
+    ctx.beginPath();
+    ctx.arc(0, 0, t.size, 0, Math.PI*2);
+    const g = ctx.createRadialGradient(-t.size*0.3, -t.size*0.3, 0, 0, 0, t.size);
+    g.addColorStop(0, lightenColor(t.color, 60));
+    g.addColorStop(1, t.color);
+    ctx.fillStyle = g;
+    ctx.fill();
+    ctx.strokeStyle = '#fff';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+
+    // Emoji
+    ctx.font = `${Math.floor(t.size * 1.1)}px serif`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(t.emoji, 0, 1);
+
+    ctx.restore();
+
+    // HP bar
+    if (t.hp < t.maxHp) {
+      const bw = t.size * 2.5, bh = 3;
+      const pct = t.hp / t.maxHp;
+      ctx.fillStyle = '#333';
+      ctx.fillRect(t.x - bw/2, t.y - t.size - 8, bw, bh);
+      ctx.fillStyle = pct > 0.5 ? '#4CAF50' : pct > 0.25 ? '#ff9800' : '#f44336';
+      ctx.fillRect(t.x - bw/2, t.y - t.size - 8, bw * pct, bh);
+    }
+  }
+}
+
+function renderProjectiles() {
+  for (const p of projectiles) {
+    if (p.dead) continue;
+    ctx.save();
+    ctx.shadowBlur = 8;
+    ctx.shadowColor = p.color;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, p.radius, 0, Math.PI*2);
+    ctx.fillStyle = p.fromBuilding ? '#ff4500' : p.color;
+    ctx.fill();
+    ctx.restore();
+  }
+}
+
+function renderExplosions() {
+  for (const e of explosions) {
+    if (e.dead) continue;
+    ctx.save();
+    ctx.globalAlpha = Math.max(0, e.alpha);
+    const rg = ctx.createRadialGradient(e.x, e.y, 0, e.x, e.y, e.radius);
+    rg.addColorStop(0, '#fff');
+    rg.addColorStop(0.3, e.color);
+    rg.addColorStop(1, 'transparent');
+    ctx.beginPath();
+    ctx.arc(e.x, e.y, e.radius, 0, Math.PI*2);
+    ctx.fillStyle = rg;
+    ctx.fill();
+    ctx.restore();
+  }
+}
+
+function renderRangeIndicator() {
+  if (gameState !== 'battle') return;
+  // Show selected troop type preview on hover — skip for mobile simplicity
+}
+
+function lightenColor(hex, amount) {
+  const num = parseInt(hex.replace('#',''), 16);
+  const r = Math.min(255, (num >> 16) + amount);
+  const g = Math.min(255, ((num >> 8) & 0xff) + amount);
+  const b = Math.min(255, (num & 0xff) + amount);
+  return `rgb(${r},${g},${b})`;
+}
+
+// ============================================================
+// INPUT
+// ============================================================
+function getCanvasPos(e) {
+  const rect = canvas.getBoundingClientRect();
+  const scaleX = canvas.width  / rect.width;
+  const scaleY = canvas.height / rect.height;
+  if (e.touches) {
+    return { x: (e.touches[0].clientX - rect.left) * scaleX,
+             y: (e.touches[0].clientY - rect.top)  * scaleY };
+  }
+  return { x: (e.clientX - rect.left) * scaleX,
+           y: (e.clientY - rect.top)  * scaleY };
+}
+
+function canvas_onclick(e) {
+  if (gameState !== 'battle') return;
+  const pos = getCanvasPos(e);
+  deployTroop(pos.x, pos.y);
+}
+
+// ============================================================
+// RESIZE & INIT
+// ============================================================
+function resize() {
+  const maxW = Math.min(window.innerWidth - 4, 900);
+  const maxH = window.innerHeight - UI_H - 20;
+  const scaleW = maxW / (COLS * TILE);
+  const scaleH = maxH / (ROWS * TILE);
+  const scale  = Math.min(scaleW, scaleH, 1);
+  const cw = Math.floor(COLS * TILE * scale);
+  const ch = Math.floor(ROWS * TILE * scale);
+
+  canvas.style.width  = cw + 'px';
+  canvas.style.height = ch + 'px';
+  canvas.width  = COLS * TILE;
+  canvas.height = ROWS * TILE;
+  document.getElementById('ui').style.width = cw + 'px';
+}
+
+window.addEventListener('load', () => {
+  canvas = document.getElementById('gameCanvas');
+  ctx    = canvas.getContext('2d');
+  resize();
+  window.addEventListener('resize', resize);
+  canvas.addEventListener('click', canvas_onclick);
+  canvas.addEventListener('touchstart', e => { e.preventDefault(); canvas_onclick(e); }, {passive: false});
+  loadSprites(() => {
+    // Show start overlay with instructions already there
+  });
+});
+</script>
+</body>
+</html>
