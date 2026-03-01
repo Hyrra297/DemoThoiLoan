@@ -195,7 +195,7 @@ const TROOPS_DEF = [
   { id: 'archer',    name: 'Archer',    emoji: '🏹', color: '#27ae60',
     hp: 20,  dps: 7,  atkInterval: 1.0, speed: 90,  range: 3.5, size: 9,  isFlying: false, splash: false },
   { id: 'giant',     name: 'Giant',     emoji: '🛡️', color: '#3498db',
-    hp: 300, dps: 11, atkInterval: 2.0, speed: 45,  range: 1.0, size: 14, isFlying: false, splash: false },
+    hp: 300, dps: 11, atkInterval: 2.0, speed: 45,  range: 0.4, size: 14, isFlying: false, splash: false },
 ];
 
 // Building defs from game config (Defence.json Level 1)
@@ -221,9 +221,9 @@ const BASE_LAYOUT = [
   // Mortars — inner, flanking TH on iso depth axis
   ['mortar',       6,  4],   // N-flank
   ['mortar',      10, 10],   // S-flank
-  // Wizard Towers — inner, flanking TH on iso lateral axis
-  ['wizard_tower',11,  6],   // E-flank
-  ['wizard_tower', 5,  8],   // W-flank
+  // Extra mortars — flanking TH on iso lateral axis
+  ['mortar',      11,  6],   // E-flank
+  ['mortar',       5,  8],   // W-flank
 ];
 
 // ============================================================
@@ -342,7 +342,12 @@ class Building {
     this.fireTimer = 0;
     this.fireRate  = def.fireInterval > 0 ? def.fireInterval * 1000 : Infinity; // ms per shot
     this.dmgShot   = def.dmgShot || 0;
-    this.hitTimer  = 0; // seconds remaining to show HP bar after taking damage
+    this.hitTimer       = 0; // seconds remaining to show HP bar after taking damage
+    this.animTime       = 0; // idle anim clock (continuous)
+    this.attackAnimTimer = 0; // > 0 while attack anim is playing
+    this.attackAnimTime  = 0; // elapsed since attack anim started
+    this.aimDirIndex    = 0; // 0..4 — which of 5 sprite directions to use
+    this.aimFlip        = false; // mirror horizontally for SW/W/NW directions
   }
 }
 
@@ -370,7 +375,7 @@ class Troop {
     this.attackRate  = def.atkInterval; // seconds between attacks (from game config)
     this.shakeX = 0;
     this.angle  = 0;
-    this.animPhase = Math.random() * Math.PI * 2; // random start offset
+    this.animTime = Math.random() * 2; // random start offset so troops don't sync-animate
     this.state  = 'idle'; // 'idle' | 'walk' | 'attack' | 'dying'
     this.attackFlash  = 0;    // flash timer for attack
     this.facing       = 1;    // 1 = right, -1 = left
@@ -394,6 +399,9 @@ class Projectile {
     this.vy = dy / dist * spd;
     this.dead = false;
     this.radius = fromBuilding ? 5 : 4;
+    // Pre-compute screen-space angle once (avoids iso-velocity approximation error)
+    const isoS = pixToIso(x, y), isoT = pixToIso(tx, ty);
+    this.screenAngle = Math.atan2(isoT.y - isoS.y, isoT.x - isoS.x);
   }
 }
 
@@ -413,8 +421,12 @@ class Explosion {
 // ============================================================
 let canvas, ctx;
 let astar;
-let buildings = [], walls = [], troops = [], projectiles = [], explosions = [], gravestones = [];
+let buildings = [], walls = [], troops = [], projectiles = [], explosions = [], gravestones = [], ghosts = [];
 let sprites = {};
+let troopFrames = {};    // { barbarian: { idle:[img,..], run:[..], attack:[..], dead:[..] }, ... }
+let buildingFrames = {}; // { cannon: { idle:[img], attack:[img,..] }, ... }
+let vfxFrames = {};      // { cannon_fire:[img,..], explosion_1:[img,..] }
+let vfxList   = [];      // active VFX instances
 let selectedTroopIdx = 0;
 let gameState = 'ready'; // 'ready' | 'battle' | 'win' | 'lose'
 let timeLeft = BATTLE_TIME;
@@ -424,6 +436,7 @@ let destroyedCount = 0;
 let totalBuildings = 0;
 let stars = 0;
 let hoverCol = -1, hoverRow = -1;
+let screenShake = 0; // pixels of shake amplitude, decays each frame
 
 // ============================================================
 // SPRITE LOADING
@@ -441,6 +454,12 @@ function loadSprites(callback) {
     troop_barbarian:   '../res/800_480/upgrade_troop/icon/ARM_1_1.png',
     troop_archer:      '../res/800_480/upgrade_troop/icon/ARM_2_1.png',
     troop_giant:       '../res/800_480/upgrade_troop/icon/ARM_4_1.png',
+    ghost:             'assets/defense_base/ghost.png',
+    rip_elixir:        'assets/defense_base/rip_elixir.png',
+    cannon_bullet:      'assets/defense_base/cannon_bullet.png',
+    baby_fire_ball:     'assets/defense_base/baby_fire_ball.png',
+    archerbullet3:      'assets/defense_base/archerbullet3.png',
+    arrow_small_burning:'assets/defense_base/arrow_small_burning.png',
   };
   let loaded = 0, total = Object.keys(paths).length;
   for (const [key, path] of Object.entries(paths)) {
@@ -449,6 +468,175 @@ function loadSprites(callback) {
     img.onerror = () => { sprites[key] = null; if (++loaded === total) callback(); };
     img.src = path;
   }
+}
+
+// ============================================================
+// TROOP FRAME LOADER
+// Pre-loads only the FIRST direction (frames 0..N-1) of each animation.
+// dir0 = "facing right"; facing left is handled by ctx.scale(-1,1).
+// ============================================================
+function loadTroopFrames(onDone) {
+  const animFolderMap = { idle: 'idle', run: 'run', attack: 'attack01', dead: 'dead' };
+  let total = 0, loaded = 0;
+  for (const def of Object.values(TROOP_ANIM_DEF))
+    for (const n of Object.values(def.frames)) total += n;
+
+  if (total === 0) { onDone(); return; }
+
+  for (const [id, def] of Object.entries(TROOP_ANIM_DEF)) {
+    troopFrames[id] = {};
+    for (const [animKey, count] of Object.entries(def.frames)) {
+      troopFrames[id][animKey] = [];
+      const folder = animFolderMap[animKey];
+      for (let i = 0; i < count; i++) {
+        const img = new Image();
+        img.src = `${def.path}/${folder}/image${String(i).padStart(4,'0')}.png`;
+        img.onload = img.onerror = () => { if (++loaded >= total) onDone(); };
+        troopFrames[id][animKey].push(img);
+      }
+    }
+  }
+}
+
+const NUM_BUILD_DIRS = 5; // each animKey folder holds framesPerDir × 5 directions sequentially
+
+function loadBuildingFrames(onDone) {
+  let total = 0, loaded = 0;
+  for (const def of Object.values(BUILDING_ANIM_DEF))
+    for (const n of Object.values(def.frames)) total += n * NUM_BUILD_DIRS;
+
+  if (total === 0) { onDone(); return; }
+
+  for (const [id, def] of Object.entries(BUILDING_ANIM_DEF)) {
+    buildingFrames[id] = {};
+    for (const [animKey, framesPerDir] of Object.entries(def.frames)) {
+      // buildingFrames[id][animKey][dirIndex][frameI]
+      buildingFrames[id][animKey] = [];
+      const folder = animKey === 'attack' ? 'attack01' : animKey;
+      for (let d = 0; d < NUM_BUILD_DIRS; d++) {
+        buildingFrames[id][animKey][d] = [];
+        for (let i = 0; i < framesPerDir; i++) {
+          const globalIdx = d * framesPerDir + i;
+          const img = new Image();
+          img.src = `${def.path}/${folder}/image${String(globalIdx).padStart(4,'0')}.png`;
+          img.onload = img.onerror = () => { if (++loaded >= total) onDone(); };
+          buildingFrames[id][animKey][d].push(img);
+        }
+      }
+    }
+  }
+}
+
+function loadVfxFrames(onDone) {
+  let total = 0, loaded = 0;
+  for (const d of Object.values(VFX_DEFS)) total += d.count;
+  if (total === 0) { onDone(); return; }
+  for (const [key, def] of Object.entries(VFX_DEFS)) {
+    vfxFrames[key] = [];
+    for (let i = 0; i < def.count; i++) {
+      const img = new Image();
+      img.src = `${def.path}/${String(i).padStart(2, '0')}.png`;
+      img.onload = img.onerror = () => { if (++loaded >= total) onDone(); };
+      vfxFrames[key].push(img);
+    }
+  }
+}
+
+// ============================================================
+// RANDOM LAYOUT GENERATORS
+// ============================================================
+function generateBaseLayout() {
+  const occupied = new Set(); // "col,row" tiles blocked (includes 1-tile margins)
+
+  function markOccupied(c, r, size, margin) {
+    for (let dr = -margin; dr < size + margin; dr++)
+      for (let dc = -margin; dc < size + margin; dc++) {
+        const bc = c + dc, br = r + dr;
+        if (bc >= 0 && br >= 0) occupied.add(`${bc},${br}`);
+      }
+  }
+  function canPlace(c, r, size) {
+    for (let dr = 0; dr < size; dr++)
+      for (let dc = 0; dc < size; dc++)
+        if (occupied.has(`${c+dc},${r+dr}`)) return false;
+    return true;
+  }
+
+  const result = [];
+
+  // Town Hall (size 4) — random position near centre (col 5–8, row 4–7)
+  const thC = 5 + Math.floor(Math.random() * 4);
+  const thR = 4 + Math.floor(Math.random() * 4);
+  result.push(['town_hall', thC, thR]);
+  markOccupied(thC, thR, 4, 1);
+
+  // Helper: place one building of given type, random first then fallback sweep
+  function placeOne(type, margin = 1) {
+    for (let attempt = 0; attempt < 300; attempt++) {
+      const c = 3 + Math.floor(Math.random() * 10); // col 3–12
+      const r = 3 + Math.floor(Math.random() * 8);  // row 3–10
+      if (c + 2 > 14 || r + 2 > 12) continue;
+      if (canPlace(c, r, 2)) {
+        result.push([type, c, r]);
+        markOccupied(c, r, 2, margin);
+        return true;
+      }
+    }
+    // Fallback sweep (no margin)
+    for (let r = 3; r <= 10; r++)
+      for (let c = 3; c <= 12; c++)
+        if (c + 2 <= 14 && r + 2 <= 12 && canPlace(c, r, 2)) {
+          result.push([type, c, r]);
+          markOccupied(c, r, 2, 0);
+          return true;
+        }
+    return false;
+  }
+
+  // ① Guaranteed: place at least 1 cannon + 1 mortar first
+  placeOne('cannon');
+  placeOne('mortar');
+
+  // ② Remaining 3 cannons + 3 mortars in random order
+  const rest = ['cannon','cannon','cannon','mortar','mortar','mortar'];
+  rest.sort(() => Math.random() - 0.5);
+  for (const type of rest) placeOne(type);
+
+  return result;
+}
+
+function generateWallLayout(layout) {
+  // Bounding box of all buildings + 1-tile margin
+  let minC = Infinity, maxC = -Infinity, minR = Infinity, maxR = -Infinity;
+  for (const [type, c, r] of layout) {
+    const size = BUILDINGS_DEF[type].size;
+    minC = Math.min(minC, c - 1);  maxC = Math.max(maxC, c + size);
+    minR = Math.min(minR, r - 1);  maxR = Math.max(maxR, r + size);
+  }
+  // Clamp to playable area
+  minC = Math.max(2, minC); maxC = Math.min(15, maxC);
+  minR = Math.max(2, minR); maxR = Math.min(13, maxR);
+
+  // Building footprint set (to skip tiles occupied by buildings)
+  const bldgTiles = new Set();
+  for (const [type, c, r] of layout) {
+    const size = BUILDINGS_DEF[type].size;
+    for (let dr = 0; dr < size; dr++)
+      for (let dc = 0; dc < size; dc++)
+        bldgTiles.add(`${c+dc},${r+dr}`);
+  }
+
+  // Rectangular perimeter
+  const walls = [];
+  for (let c = minC; c <= maxC; c++) {
+    if (!bldgTiles.has(`${c},${minR}`)) walls.push([c, minR]);
+    if (!bldgTiles.has(`${c},${maxR}`)) walls.push([c, maxR]);
+  }
+  for (let r = minR + 1; r < maxR; r++) {
+    if (!bldgTiles.has(`${minC},${r}`)) walls.push([minC, r]);
+    if (!bldgTiles.has(`${maxC},${r}`)) walls.push([maxC, r]);
+  }
+  return walls;
 }
 
 // ============================================================
@@ -462,15 +650,19 @@ function initGame() {
   const btnStart = document.getElementById('btnStart');
   btnStart.textContent = '⚔️ CHIẾN!';
   btnStart.disabled = false;
-  troops = []; projectiles = []; explosions = []; gravestones = [];
+  troops = []; projectiles = []; explosions = []; gravestones = []; ghosts = []; vfxList = [];
   destroyedCount = 0;
 
   // Build pathfinding grid
   astar = new AStar(COLS, ROWS);
 
+  // Generate random layout for this round
+  const activeLayout     = generateBaseLayout();
+  const activeWallLayout = generateWallLayout(activeLayout);
+
   // Place buildings
   buildings = [];
-  for (const [type, col, row] of BASE_LAYOUT) {
+  for (const [type, col, row] of activeLayout) {
     const def = BUILDINGS_DEF[type];
     const b   = new Building(type, col, row, def);
     b.sprite  = sprites[type] || null;
@@ -479,11 +671,9 @@ function initGame() {
       for (let c = col; c < col + def.size; c++)
         astar.setBlocked(c, r);
   }
-  totalBuildings = buildings.length; // walls excluded from destroy%
-
   // Place walls
   walls = [];
-  for (const [wc, wr] of WALL_LAYOUT) {
+  for (const [wc, wr] of activeWallLayout) {
     // skip if a building already occupies this tile
     if (astar.grid[wr] && astar.grid[wr][wc] === 1) continue;
     const w = new Building('wall', wc, wr, WALL_DEF);
@@ -491,6 +681,7 @@ function initGame() {
     walls.push(w);
     astar.setBlocked(wc, wr);
   }
+  totalBuildings = buildings.length + walls.length; // walls included in destroy%
 
   updateTimerDisplay();
   updatePercentDisplay();
@@ -552,8 +743,14 @@ function deployTroop(pixelX, pixelY) {
   if (astar.grid[r][c] === 1) return;
 
   const def = TROOPS_DEF[selectedTroopIdx];
-  const t = new Troop(def, c * TILE + TILE/2, r * TILE + TILE/2);
+  const spawnX = c * TILE + TILE/2, spawnY = r * TILE + TILE/2;
+  const t = new Troop(def, spawnX, spawnY);
+  // Set initial facing toward map center so troop doesn't face the camera on spawn
+  const mapCX = COLS / 2 * TILE, mapCY = ROWS / 2 * TILE;
+  const isoDir = (mapCX - spawnX) - (mapCY - spawnY);
+  t.facing = isoDir >= 0 ? 1 : -1;
   troops.push(t);
+  spawnVfx('drop_troops', spawnX, spawnY);
 }
 
 // ============================================================
@@ -569,10 +766,13 @@ function gameLoop(now) {
 }
 
 function update(dt) {
+  if (screenShake > 0) screenShake = Math.max(0, screenShake - dt * 55);
   updateTroops(dt);
   updateBuildings(dt);
   updateProjectiles(dt);
   updateExplosions(dt);
+  updateGhosts(dt);
+  updateVfx(dt);
   // Check all buildings dead (walls don't count)
   const alive = buildings.filter(b => !b.dead);
   if (alive.length === 0 && buildings.length > 0) endBattle();
@@ -583,12 +783,14 @@ function updateTroops(dt) {
   for (const t of troops) {
     if (t.dead) continue;
 
+    // Advance animation clock for all non-dead troops (including dying)
+    t.animTime += dt;
+
     // Dying: run fall animation then mark dead + spawn gravestone
     if (t.state === 'dying') {
       t.deathTimer += dt;
       if (t.deathTimer >= t.deathDuration) {
         t.dead = true;
-        gravestones.push({ x: t.x, y: t.y });
       }
       continue;
     }
@@ -606,18 +808,33 @@ function updateTroops(dt) {
     const dist = Math.sqrt(dx*dx + dy*dy);
 
     if (dist <= t.range + tb.size * TILE / 2) {
-      // Attack
+      // Attack — face toward the target
       t.vx = 0; t.vy = 0;
       t.state = 'attack';
-      t.animPhase += dt * 8;
+      const isoDx = dx - dy;
+      if (Math.abs(isoDx) > 0.01) t.facing = isoDx > 0 ? 1 : -1;
       t.attackTimer -= dt;
       if (t.attackTimer <= 0) {
         t.attackTimer = t.attackRate;
-        t.attackFlash = 0.3; // flash duration in seconds
-        const clr = t.def.color;
-        const proj = new Projectile(t.x, t.y, tb.cx, tb.cy,
-          t.dps * t.attackRate, clr, t.splash, false);
-        projectiles.push(proj);
+        t.attackFlash = 0.3;
+        const tmap = TROOP_BULLET_MAP[t.def.id];
+        if (tmap) {
+          // Ranged troop: fire a projectile with sprite
+          const proj = new Projectile(t.x, t.y, tb.cx, tb.cy,
+            t.dps * t.attackRate, t.def.color, t.splash, false);
+          proj.bulletSprite = tmap.key;
+          proj.bulletSize   = tmap.size;
+          if (tmap.rotOffset) proj.rotOffset = tmap.rotOffset;
+          projectiles.push(proj);
+        } else if (t.def.id !== 'giant') {
+          // Other non-giant troops: plain circle projectile
+          projectiles.push(new Projectile(t.x, t.y, tb.cx, tb.cy,
+            t.dps * t.attackRate, t.def.color, t.splash, false));
+        } else {
+          // Giant: melee — apply damage directly, no projectile
+          applyBuildingDamage(tb, t.dps * t.attackRate);
+          spawnVfx('atk_hit', tb.cx, tb.cy);
+        }
       }
       if (t.attackFlash > 0) t.attackFlash -= dt;
     } else {
@@ -639,8 +856,8 @@ function updateTroops(dt) {
           const raw = astar.findPath(sc, sr, gAlt.c, gAlt.r) || [];
           t.path = smoothPath(raw);
           t.pathIdx = 0;
-          // If path failed, retry after 0.25s instead of every frame
-          t.pathRetry = t.path.length === 0 ? 0.25 : 0;
+          // If path failed, retry after a short delay instead of every frame
+          t.pathRetry = t.path.length === 0 ? 0.05 : 0;
         }
 
         const spd = t.speed / 60;
@@ -668,10 +885,15 @@ function updateTroops(dt) {
       t.x += t.vx * dt * 60;
       t.y += t.vy * dt * 60;
       t.angle = Math.atan2(t.vy, t.vx);
-      if (Math.abs(t.vx) > 0.1) t.facing = t.vx > 0 ? 1 : -1;
-      // walk animation speed based on troop speed
-      const walkFreq = t.def.id === 'giant' ? 5 : 9;
-      t.animPhase += dt * walkFreq;
+      // Facing based on direction to next waypoint (no steering lag)
+      if (t.path.length > 0 && t.pathIdx < t.path.length) {
+        const wp = t.path[t.pathIdx];
+        const isoDir = (wp.c * TILE + TILE / 2 - t.x) - (wp.r * TILE + TILE / 2 - t.y);
+        if (Math.abs(isoDir) > 1) t.facing = isoDir > 0 ? 1 : -1;
+      } else if (dist > 1) {
+        const isoDir = dx - dy;
+        if (Math.abs(isoDir) > 1) t.facing = isoDir > 0 ? 1 : -1;
+      }
     }
     // Clamp to canvas
     t.x = Math.max(t.size, Math.min(COLS*TILE - t.size, t.x));
@@ -680,21 +902,34 @@ function updateTroops(dt) {
 }
 
 function findTarget(troop) {
-  let closest = null, minDist = Infinity;
-  // Search buildings first
+  // Find closest building
+  let closestBuilding = null, minBuildDist = Infinity;
   for (const b of buildings) {
     if (b.dead) continue;
     if (b.priority === 'ground' && troop.isFlying) continue;
     const d = Math.hypot(b.cx - troop.x, b.cy - troop.y);
-    if (d < minDist) { minDist = d; closest = b; }
+    if (d < minBuildDist) { minBuildDist = d; closestBuilding = b; }
   }
-  // Then walls (lower priority — only chosen if closer than any building)
+
+  // Check if the closest building is reachable (no wall barrier)
+  if (closestBuilding) {
+    const sc = Math.min(Math.max(Math.floor(troop.x / TILE), 0), COLS - 1);
+    const sr = Math.min(Math.max(Math.floor(troop.y / TILE), 0), ROWS - 1);
+    const gc = closestBuilding.col + Math.floor(closestBuilding.size / 2);
+    const gr = closestBuilding.row + Math.floor(closestBuilding.size / 2);
+    const gAlt = findNearestWalkable(gc, gr, troop);
+    const path = astar.findPath(sc, sr, gAlt.c, gAlt.r);
+    if (path && path.length > 0) return closestBuilding;
+  }
+
+  // Building path blocked — target the closest wall to break through
+  let closestWall = null, minWallDist = Infinity;
   for (const w of walls) {
     if (w.dead) continue;
     const d = Math.hypot(w.cx - troop.x, w.cy - troop.y);
-    if (d < minDist) { minDist = d; closest = w; }
+    if (d < minWallDist) { minWallDist = d; closestWall = w; }
   }
-  return closest;
+  return closestWall || closestBuilding;
 }
 
 function findNearestWalkable(gc, gr, troop) {
@@ -714,16 +949,32 @@ function findNearestWalkable(gc, gr, troop) {
   return {c: gc, r: gr};
 }
 
+// Map iso screen angle (radians) to one of 5 sprite directions + optional horizontal flip.
+// CW-from-N convention: dirList = ["1"=N, "5"=S, "6"=SW, "7"=W, "8"=NW]
+// Right-side directions (NE, E, SE) are obtained by horizontally flipping left-side sprites.
+function angleToDir(rad) {
+  const deg = rad * 180 / Math.PI;
+  if (deg > 166.7 || deg < -166.7) return { dirIndex: 3, flip: false }; // W  → sprite "7"
+  if (deg < -121.7)                 return { dirIndex: 4, flip: false }; // NW → sprite "8"
+  if (deg <  -58.3)                 return { dirIndex: 0, flip: false }; // N  → sprite "1"
+  if (deg <  -13.3)                 return { dirIndex: 2, flip: true  }; // NE → flip "6"(SW)
+  if (deg <   13.3)                 return { dirIndex: 3, flip: true  }; // E  → flip "7"(W)
+  if (deg <   58.3)                 return { dirIndex: 4, flip: true  }; // SE → flip "8"(NW)
+  if (deg <  121.7)                 return { dirIndex: 1, flip: false }; // S  → sprite "5"
+  return                            { dirIndex: 2, flip: false };        // SW → sprite "6"
+}
+
 // ---- BUILDINGS ----
 function updateBuildings(dt) {
   for (const b of buildings) {
     if (b.dead) continue;
+    b.animTime += dt;
+    if (b.attackAnimTimer > 0) { b.attackAnimTimer -= dt; b.attackAnimTime += dt; }
     if (b.hitTimer > 0) b.hitTimer -= dt;
     if (b.dps <= 0) continue;
     b.fireTimer -= dt * 1000;
-    if (b.fireTimer > 0) continue;
 
-    // Find troop target
+    // Always find closest in-range troop for continuous aiming
     let targetTroop = null, minDist = Infinity;
     for (const t of troops) {
       if (t.dead || t.state === 'dying') continue;
@@ -732,12 +983,43 @@ function updateBuildings(dt) {
       const d = Math.sqrt(dx*dx+dy*dy);
       if (d <= b.range * TILE && d < minDist) { minDist = d; targetTroop = t; }
     }
-    if (!targetTroop) continue;
+
+    // Update facing direction toward target every frame (smooth rotation)
+    if (targetTroop) {
+      const isoS = pixToIso(b.cx, b.cy);
+      const isoT = pixToIso(targetTroop.x, targetTroop.y);
+      const { dirIndex, flip } = angleToDir(Math.atan2(isoT.y - isoS.y, isoT.x - isoS.x));
+      b.aimDirIndex = dirIndex;
+      b.aimFlip     = flip;
+    }
+
+    if (b.fireTimer > 0 || !targetTroop) continue;
 
     b.fireTimer = b.fireRate;
+    // Trigger attack animation
+    const badef = BUILDING_ANIM_DEF[b.type];
+    if (badef) {
+      b.attackAnimTimer = badef.frames.attack / badef.fps.attack;
+      b.attackAnimTime  = 0;
+    }
+    // Muzzle flash for cannon
+    if (b.type === 'cannon') spawnVfx('cannon_fire', b.cx, b.cy);
+
     const clr = b.def.color;
     const proj = new Projectile(b.cx, b.cy, targetTroop.x, targetTroop.y,
       b.dmgShot, clr, b.splash, true);
+    const bmap = BULLET_SPRITE_MAP[b.type];
+    if (bmap) {
+      proj.bulletSprite = bmap.key;
+      proj.bulletSize   = bmap.size;
+      if (bmap.hitVfx) proj.hitVfx = bmap.hitVfx;
+      if (bmap.speed)  { proj.vx *= bmap.speed / 180; proj.vy *= bmap.speed / 180; }
+      if (bmap.arc) {
+        proj.arcHeight  = bmap.arcHeight;
+        proj.totalDist  = Math.hypot(targetTroop.x - b.cx, targetTroop.y - b.cy) || 1;
+        proj.hitVfx     = 'mortalbullet_explosion'; // mortar impact effect
+      }
+    }
     projectiles.push(proj);
   }
 }
@@ -753,14 +1035,13 @@ function updateProjectiles(dt) {
       p.dead = true;
       // Hit
       if (p.fromBuilding) {
-        // Damage troops
+        // Damage troops — no explosion effect on troops
         if (p.splash) {
           for (const t of troops) { if (!t.dead) { const d=Math.hypot(t.x-p.tx,t.y-p.ty); if(d<TILE*2) applyTroopDamage(t, p.dmg * (1-d/(TILE*2.5))); } }
-          explosions.push(new Explosion(p.tx, p.ty, TILE*2, p.color));
         } else {
           for (const t of troops) { if (!t.dead && Math.hypot(t.x-p.tx,t.y-p.ty) < TILE) applyTroopDamage(t, p.dmg); }
-          explosions.push(new Explosion(p.tx, p.ty, TILE*0.7, p.color));
         }
+        if (p.hitVfx) spawnVfx(p.hitVfx, p.tx, p.ty);
       } else {
         // Damage buildings + walls
         const allTargets = [...buildings, ...walls];
@@ -771,6 +1052,7 @@ function updateProjectiles(dt) {
           for (const b of allTargets) { if (!b.dead && Math.hypot(b.cx-p.tx,b.cy-p.ty) < TILE*b.size/2+10) applyBuildingDamage(b, p.dmg); }
           explosions.push(new Explosion(p.tx, p.ty, TILE*0.6, p.color));
         }
+        spawnVfx('atk_hit', p.tx, p.ty);
       }
     }
   }
@@ -780,13 +1062,12 @@ function updateProjectiles(dt) {
 function applyTroopDamage(t, dmg) {
   if (t.state === 'dying') return; // already falling, ignore further hits
   t.hp -= dmg;
-  t.shakeX = 3;
   if (t.hp <= 0) {
     t.hp = 0;
     t.state = 'dying';
     t.deathTimer = 0;
     t.vx = 0; t.vy = 0;
-    explosions.push(new Explosion(t.x, t.y, TILE, '#ff6b6b'));
+    ghosts.push({ x: t.x, y: t.y, timer: 0, duration: 0.9 }); // ghost flies up simultaneously
   }
 }
 
@@ -801,14 +1082,17 @@ function applyBuildingDamage(b, dmg) {
     for (let r = b.row; r < b.row+b.size; r++)
       for (let c = b.col; c < b.col+b.size; c++)
         astar.clearBlocked(c, r);
+    destroyedCount++;
+    spawnVfx('explosion_1', b.cx, b.cy);
     if (b.type === 'wall') {
       explosions.push(new Explosion(b.cx, b.cy, TILE * 1.5, '#aaa'));
+      screenShake = Math.max(screenShake, 4);
     } else {
-      destroyedCount++;
       explosions.push(new Explosion(b.cx, b.cy, TILE * b.size * 1.2, '#ff4500'));
+      screenShake = Math.max(screenShake, 8);
     }
-    // Clear paths so troops re-route
-    for (const t of troops) { t.path = []; t.pathIdx = 0; t.target = null; }
+    // Clear paths so troops re-route through the new gap (keep targets — only re-target if their own target died)
+    for (const t of troops) { t.path = []; t.pathIdx = 0; t.pathRetry = 0; }
     updatePercentDisplay();
   }
 }
@@ -819,6 +1103,45 @@ function updateExplosions(dt) {
     e.radius += dt * 30;
     if (e.alpha <= 0) e.dead = true;
   }
+}
+
+function spawnVfx(key, x, y) {
+  const def = VFX_DEFS[key];
+  if (!def) return;
+  vfxList.push({ key, x, y, size: def.size, fps: def.fps,
+                 yOffset: def.yOffset || 0,
+                 timer: 0, duration: def.count / def.fps });
+}
+function updateVfx(dt) {
+  for (const v of vfxList) v.timer += dt;
+  vfxList = vfxList.filter(v => v.timer < v.duration);
+}
+function drawVfxItem(v) {
+  const frames = vfxFrames[v.key];
+  if (!frames || !frames.length) return;
+  const fi  = Math.min(Math.floor(v.timer * v.fps), frames.length - 1);
+  const img = frames[fi];
+  if (!img || !img.complete || !img.naturalWidth) return;
+  const iso = pixToIso(v.x, v.y);
+  const h = v.size, w = h * img.naturalWidth / img.naturalHeight;
+  const drawY = iso.y + (v.yOffset || 0);
+  ctx.save();
+  ctx.drawImage(img, iso.x - w / 2, drawY - h / 2, w, h);
+  ctx.restore();
+}
+
+function updateGhosts(dt) {
+  for (const g of ghosts) {
+    if (g.done) continue;
+    g.timer += dt;
+    // Spawn rip_elixir early (at 60% of ghost anim) so it appears while ghost fades
+    if (!g.gravestoneSpawned && g.timer >= g.duration * 0.6) {
+      g.gravestoneSpawned = true;
+      gravestones.push({ x: g.x, y: g.y });
+    }
+    if (g.timer >= g.duration) g.done = true;
+  }
+  ghosts = ghosts.filter(g => !g.done || g.timer < g.duration + 0.1);
 }
 
 // ============================================================
@@ -905,29 +1228,19 @@ function strokeIsoDiamond(col, row, stroke, lw, liftY) {
 // ============================================================
 function render() {
   ctx.clearRect(0, 0, ISO_W, ISO_H);
-
+  ctx.save();
+  if (screenShake > 0.3) {
+    ctx.translate(
+      (Math.random() * 2 - 1) * screenShake,
+      (Math.random() * 2 - 1) * screenShake * 0.5
+    );
+  }
   renderMap();
   renderExplosions();
-  renderGravestones();
-  renderWallsAndBuildings();
+  renderWallsAndBuildings(); // includes gravestones + ghosts (depth-sorted)
   renderTroops();
   renderProjectiles();
   renderDeployPreview();
-}
-
-function renderGravestones() {
-  if (gravestones.length === 0) return;
-  ctx.save();
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'bottom';
-  // Sort back-to-front so gravestones respect iso depth order
-  const sorted = [...gravestones].sort((a, b) => (a.x + a.y) - (b.x + b.y));
-  for (const g of sorted) {
-    const iso = pixToIso(g.x, g.y);
-    ctx.globalAlpha = 0.82;
-    ctx.font = '14px serif';
-    ctx.fillText('🪦', iso.x, iso.y + 2);
-  }
   ctx.restore();
 }
 
@@ -991,15 +1304,59 @@ function drawMapCrystal(col, row) {
 }
 
 function renderWallsAndBuildings() {
-  // Merge walls + buildings into one list sorted by col+row (painter's algorithm)
   const items = [];
-  walls.filter(w => !w.dead).forEach(w => items.push({ kind: 'wall',     obj: w, depth: w.col + w.row }));
-  buildings.filter(b => !b.dead).forEach(b => items.push({ kind: 'building', obj: b, depth: b.col + b.row + b.size * 0.5 }));
+  walls.filter(w => !w.dead).forEach(w =>
+    items.push({ kind: 'wall',       obj: w, depth: w.col + w.row }));
+  buildings.filter(b => !b.dead).forEach(b =>
+    items.push({ kind: 'building',   obj: b, depth: b.col + b.row + b.size * 0.5 }));
+  // gravestones + ghosts share depth sort so they appear in front of/behind walls correctly
+  gravestones.forEach(g =>
+    items.push({ kind: 'gravestone', obj: g, depth: g.x / TILE + g.y / TILE }));
+  ghosts.forEach(g =>
+    items.push({ kind: 'ghost',      obj: g, depth: g.x / TILE + g.y / TILE }));
+  vfxList.forEach(v =>
+    items.push({ kind: 'vfx',        obj: v, depth: v.x / TILE + v.y / TILE }));
+
   items.sort((a, b) => a.depth - b.depth);
   for (const item of items) {
-    if (item.kind === 'wall') drawWall(item.obj);
-    else drawBuilding(item.obj);
+    if      (item.kind === 'wall')       drawWall(item.obj);
+    else if (item.kind === 'building')   drawBuilding(item.obj);
+    else if (item.kind === 'gravestone') drawGravestoneItem(item.obj);
+    else if (item.kind === 'ghost')      drawGhostItem(item.obj);
+    else if (item.kind === 'vfx')        drawVfxItem(item.obj);
   }
+}
+
+function drawGravestoneItem(g) {
+  const sp  = sprites.rip_elixir;
+  const iso = pixToIso(g.x, g.y);
+  ctx.save();
+  if (sp && sp.complete && sp.naturalWidth > 0) {
+    const h = 28, w = h * sp.naturalWidth / sp.naturalHeight;
+    ctx.globalAlpha = 0.88;
+    ctx.drawImage(sp, iso.x - w / 2, iso.y - h / 2, w, h);
+  } else {
+    ctx.globalAlpha = 0.82;
+    ctx.font = '14px serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'bottom';
+    ctx.fillText('🪦', iso.x, iso.y + 2);
+  }
+  ctx.restore();
+}
+
+function drawGhostItem(g) {
+  const sp = sprites.ghost;
+  if (!sp || !sp.complete || !sp.naturalWidth) return;
+  const prog  = Math.min(1, g.timer / g.duration);
+  const liftY = prog * 50;
+  const scale = 1 + prog * 0.3;
+  const iso   = pixToIso(g.x, g.y);
+  const h = 26 * scale, w = h * sp.naturalWidth / sp.naturalHeight;
+  ctx.save();
+  ctx.globalAlpha = (1 - prog) * 0.92;
+  ctx.drawImage(sp, iso.x - w / 2, iso.y - h / 2 - liftY, w, h);
+  ctx.restore();
 }
 
 function drawBuilding(b) {
@@ -1036,13 +1393,37 @@ function drawBuilding(b) {
     ctx.lineWidth = 1.5;
     ctx.stroke();
 
-    // ── Building sprite centered at iso.y (same center as grass tile) ─
+    // ── Building sprite ──────────────────────────────────────
     const maxW = tw * 1.6;
     const maxH = Math.max(th * 3.5, 50);
     let drawnH = maxH;
+    let spriteTopY = iso.y - drawnH / 2; // default: centered at iso.y
 
-    if (b.type === 'archer_tower') {
-      drawnH = drawArcherTowerCanvas(iso, iso.y, maxW);
+    const badef = BUILDING_ANIM_DEF[b.type];
+    const bf    = buildingFrames[b.type];
+    if (badef && bf) {
+      // Animated defense building — pick direction array from aimDirIndex
+      const animKey  = b.attackAnimTimer > 0 ? 'attack' : 'idle';
+      const dirFrames = bf[animKey][b.aimDirIndex] || bf[animKey][0];
+      const fps      = badef.fps[animKey];
+      const fi       = Math.floor(b.attackAnimTimer > 0 ? b.attackAnimTime * fps : b.animTime * fps)
+                       % Math.max(1, dirFrames.length);
+      const img = dirFrames[fi];
+      if (img && img.complete && img.naturalWidth > 0) {
+        const sw = tw * 1.54;
+        const sh = sw * badef.frInfo.height / badef.frInfo.width;
+        ctx.save();
+        if (b.aimFlip) {
+          ctx.translate(iso.x, 0);
+          ctx.scale(-1, 1);
+          ctx.drawImage(img, -sw / 2, iso.y - sh / 2, sw, sh);
+        } else {
+          ctx.drawImage(img, iso.x - sw / 2, iso.y - sh / 2, sw, sh);
+        }
+        ctx.restore();
+        drawnH = sh;
+        spriteTopY = iso.y - sh / 2;
+      }
     } else if (b.sprite && b.sprite.complete && b.sprite.naturalWidth > 0) {
       const scl = Math.min(maxW / b.sprite.naturalWidth, maxH / b.sprite.naturalHeight);
       const sw = b.sprite.naturalWidth * scl, sh = b.sprite.naturalHeight * scl;
@@ -1056,7 +1437,7 @@ function drawBuilding(b) {
     if (b.hitTimer > 0 && b.hp < b.maxHp) {
       const bpct = b.hp / b.maxHp;
       const barW = tw * 1.6, barH = 5;
-      const barY = iso.y - drawnH/2 - 7;
+      const barY = spriteTopY - 7;
       ctx.fillStyle = '#1a1a1a';
       ctx.fillRect(iso.x - barW/2, barY, barW, barH);
       ctx.fillStyle = '#e53935';
@@ -1164,51 +1545,42 @@ function renderTroops() {
 
       ctx.save();
       ctx.globalAlpha = alpha;
-      ctx.translate(iso.x, iso.y + t.size * 0.3); // pivot at feet level
+      ctx.translate(iso.x, iso.y); // pivot at ground/feet level
       ctx.rotate(angle);
       ctx.scale(sc, sc);
-      drawTroop(ctx, t.def, 0, 'idle', t.facing, 0, 0);
+      drawTroop(ctx, t.def, t.animTime, 'dying', t.facing, 0, 0);
       ctx.restore();
       continue; // skip HP bar for dying troops
     }
 
     // ── NORMAL RENDERING ─────────────────────────────────────
 
-    // Walk bob
-    const freq = t.def.id === 'giant' ? 1.0 : 1.5;
+    // Walk bob (use animTime with per-troop frequency for bob oscillation)
+    const bobFreq = t.def.id === 'giant' ? 6 : 9; // Hz in animTime-space
     let bobY = 0;
     if (t.state === 'walk') {
-      bobY = -Math.abs(Math.sin(t.animPhase * freq)) * (t.def.id === 'giant' ? 4 : 2.5);
-    }
-
-    // Attack lunge: lean forward slightly during flash
-    let lungeX = 0;
-    if (t.state === 'attack' && t.attackFlash > 0) {
-      const p = Math.sin(Math.min(1, t.attackFlash / 0.3) * Math.PI);
-      lungeX = t.facing * p * t.size * 0.4;
+      bobY = -Math.abs(Math.sin(t.animTime * bobFreq)) * (t.def.id === 'giant' ? 4 : 2.5);
     }
 
     // Ground shadow
     const shadowScale = t.state === 'walk'
-      ? 0.85 + Math.abs(Math.sin(t.animPhase * freq)) * 0.08 : 0.85;
+      ? 0.85 + Math.abs(Math.sin(t.animTime * bobFreq)) * 0.08 : 0.85;
     ctx.fillStyle = 'rgba(0,0,0,0.22)';
     ctx.beginPath();
     ctx.ellipse(iso.x, iso.y + 2, t.size * shadowScale, t.size * 0.25, 0, 0, Math.PI*2);
     ctx.fill();
 
     // Draw character
-    const dmgFlash = Math.min(1, Math.abs(t.shakeX) / 3);
     ctx.save();
-    ctx.translate(iso.x + t.shakeX + lungeX, iso.y + bobY);
-    t.shakeX *= 0.7;
-    drawTroop(ctx, t.def, t.animPhase, t.state, t.facing, t.attackFlash, dmgFlash);
+    ctx.translate(iso.x, iso.y + bobY);
+    drawTroop(ctx, t.def, t.animTime, t.state, t.facing, 0, 0);
     ctx.restore();
 
     // HP bar (red, only when damaged)
     if (t.hp < t.maxHp) {
       const bw = t.size * 2.8, bh = 3;
       const pct = t.hp / t.maxHp;
-      const bary = iso.y + bobY - t.size * 1.6 - 6;
+      const bary = iso.y + bobY - t.size * 7.5 + t.size * 5 - 4; // above sprite top
       ctx.fillStyle = '#222';
       ctx.fillRect(iso.x - bw/2, bary, bw, bh);
       ctx.fillStyle = pct > 0.5 ? '#4CAF50' : pct > 0.25 ? '#ff9800' : '#f44336';
@@ -1221,14 +1593,46 @@ function renderProjectiles() {
   for (const p of projectiles) {
     if (p.dead) continue;
     const iso = pixToIso(p.x, p.y);
-    ctx.save();
-    ctx.shadowBlur = 8;
-    ctx.shadowColor = p.color;
-    ctx.beginPath();
-    ctx.arc(iso.x, iso.y, p.radius, 0, Math.PI*2);
-    ctx.fillStyle = p.fromBuilding ? '#ff4500' : p.color;
-    ctx.fill();
-    ctx.restore();
+    const sp = p.bulletSprite ? sprites[p.bulletSprite] : null;
+
+    if (sp && sp.complete && sp.naturalWidth > 0) {
+      // Arc trajectory (mortar): compute vertical lift from parabola
+      let liftY = 0;
+      if (p.arcHeight && p.totalDist) {
+        const curDist = Math.hypot(p.tx - p.x, p.ty - p.y);
+        const progress = Math.max(0, Math.min(1, 1 - curDist / p.totalDist));
+        liftY = p.arcHeight * Math.sin(progress * Math.PI);
+        // Ground shadow shrinks as ball rises
+        const shadowAlpha = 0.28 * (1 - liftY / p.arcHeight * 0.7);
+        const shadowScale = 1 - liftY / p.arcHeight * 0.5;
+        ctx.save();
+        ctx.globalAlpha = shadowAlpha;
+        ctx.fillStyle = '#000';
+        ctx.beginPath();
+        ctx.ellipse(iso.x, iso.y + 2, 7 * shadowScale, 3 * shadowScale, 0, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+      }
+
+      const angle = p.screenAngle + (p.rotOffset || 0);
+      const h = p.bulletSize;
+      const w = h * sp.naturalWidth / sp.naturalHeight;
+      ctx.save();
+      ctx.translate(iso.x, iso.y - liftY);
+      ctx.rotate(angle);
+      ctx.drawImage(sp, -w / 2, -h / 2, w, h);
+      ctx.restore();
+    } else {
+      // Fallback: glowing circle (troop bullets or missing sprite)
+      ctx.save();
+      ctx.shadowBlur = 8;
+      ctx.shadowColor = p.color;
+      ctx.beginPath();
+      ctx.arc(iso.x, iso.y, p.radius, 0, Math.PI * 2);
+      ctx.fillStyle = p.fromBuilding ? '#ff4500' : p.color;
+      ctx.fill();
+      ctx.restore();
+    }
   }
 }
 
@@ -1270,7 +1674,7 @@ function renderDeployPreview() {
   ctx.save();
   ctx.globalAlpha = 0.6 + Math.sin(t2 * 5) * 0.08;
   ctx.translate(iso.x, iso.y);
-  drawTroop(ctx, def, t2 * 7, 'walk', 1, 0, 0);
+  drawTroop(ctx, def, t2, 'walk', 1, 0, 0);
   ctx.restore();
 }
 
@@ -1303,70 +1707,129 @@ function pill(ctx, x, y, w, h, r) {
   ctx.closePath();
 }
 
-// Map troop id → sprite key
+// Map troop id → sprite key (icon fallback)
 const TROOP_SPRITE_KEY = {
   barbarian: 'troop_barbarian',
   archer:    'troop_archer',
   giant:     'troop_giant',
 };
 
-function drawTroop(ctx, def, phase, state, facing, flash, dmgFlash) {
+// Bullet sprite per building type
+const BULLET_SPRITE_MAP = {
+  cannon:       { key: 'cannon_bullet',       size: 11, hitVfx: 'cannon_hit', speed: 281 },
+  archer_tower: { key: 'arrow_small_burning', size: 16 },
+  wizard_tower: { key: 'arrow_small_burning', size: 16 },
+  mortar:       { key: 'baby_fire_ball',      size: 14, arc: true, arcHeight: 72 },
+};
+
+// Bullet sprite per troop type (undefined = melee, no projectile)
+const TROOP_BULLET_MAP = {
+  archer: { key: 'archerbullet3', size: 17, rotOffset: -Math.PI / 2 },
+};
+
+// VFX animation definitions (frame files named 00.png, 01.png, ...)
+const VFX_DEFS = {
+  cannon_fire:          { path: 'assets/defense_base/cannon_fire',          count: 10, fps: 22, size: 72 },
+  cannon_hit:           { path: 'assets/defense_base/cannon_hit',           count: 11, fps: 20, size: 50, yOffset: 12 },
+  explosion_1:          { path: 'assets/defense_base/explosion_1',          count: 11, fps: 18, size: 110 },
+  mortalbullet_explosion: { path: 'assets/defense_base/mortalbullet_explosion', count: 12, fps: 18, size: 76 },
+  drop_troops:          { path: 'assets/defense_base/drop_troops',           count: 8,  fps: 16, size: 39 },
+  atk_hit:              { path: 'assets/defense_base/AtkHit_00',             count: 6,  fps: 20, size: 64 },
+};
+
+// Defense building animation definitions (direction "1" = first frCounts[actIdx] frames)
+// cannon=DEF_1_1, mortar=DEF_3_1 — archer_tower/wizard_tower use static sprites
+const BUILDING_ANIM_DEF = {
+  cannon: {
+    path:   'assets/defense/DEF_1_1/DEF_1_1',
+    frames: { idle: 1, attack: 4 },
+    fps:    { idle: 1, attack: 8 },
+    frInfo: { width: 200, height: 252 },
+  },
+  mortar: {
+    path:   'assets/defense/DEF_3_1/DEF_3_1',
+    frames: { idle: 1, attack: 5 },
+    fps:    { idle: 1, attack: 8 },
+    frInfo: { width: 275, height: 356 },
+  },
+};
+
+// Sprite-sheet animation definitions (1 direction = first N frames of each folder)
+// framesPerDir × 5 dirs = total PNGs in each folder
+const TROOP_ANIM_DEF = {
+  barbarian: {
+    path:   'assets/troops/ARM_1_1/ARM_1_1',
+    frames: { idle: 6,  run: 14, attack: 13, dead: 1 },
+    fps:    { idle: 10, run: 14, attack: 13, dead: 1 },
+  },
+  archer: {
+    path:   'assets/troops/ARM_2_1/ARM_2_1',
+    frames: { idle: 6,  run: 16, attack: 16, dead: 1 },
+    fps:    { idle: 10, run: 15, attack: 16, dead: 1 },
+  },
+  giant: {
+    path:   'assets/troops/ARM_4_1/ARM_4_1',
+    frames: { idle: 6, run: 16, attack: 13, dead: 1 },
+    fps:    { idle: 8, run: 12, attack:  7, dead: 1 },
+  },
+};
+
+function drawTroop(ctx, def, animTime, state, facing, flash, dmgFlash) {
   ctx.save();
-  const s  = def.size;
-  const sp = sprites[TROOP_SPRITE_KEY[def.id]];
+  const s   = def.size;
+  const adef = TROOP_ANIM_DEF[def.id];
+  const tf   = troopFrames[def.id];
 
-  if (sp && sp.complete && sp.naturalWidth > 0) {
-    // ── Sprite-based rendering with animation transforms ──────
-    const freq = def.id === 'giant' ? 1.0 : 1.5;
-    const bn   = Math.abs(Math.sin(phase * freq)); // 0 = ground, 1 = peak
+  // ── Sprite-frame animation ────────────────────────────────
+  if (tf && adef) {
+    let animKey, fps;
+    if      (state === 'dying')  { animKey = 'dead';   fps = adef.fps.dead;   }
+    else if (state === 'attack') { animKey = 'attack';  fps = adef.fps.attack; }
+    else if (state === 'walk')   { animKey = 'run';     fps = adef.fps.run;    }
+    else                         { animKey = 'idle';    fps = adef.fps.idle;   }
 
-    let scX = 1, scY = 1;
-    if (state === 'walk') {
-      scY = 1 + bn * 0.10;   // stretch tall at peak
-      scX = 1 - bn * 0.05;   // narrow at peak (squash-stretch)
-    } else if (state === 'attack' && flash > 0) {
-      // Quick punch-scale pulse
-      const p = Math.sin(Math.min(1, flash / 0.3) * Math.PI);
-      scX = 1 + p * 0.20;
-      scY = 1 - p * 0.10;
+    const frames = tf[animKey];
+    if (frames && frames.length > 0) {
+      const fi  = Math.floor(animTime * fps) % frames.length;
+      const img = frames[fi];
+      if (img && img.complete && img.naturalWidth > 0) {
+        const baseH = s * 7.5;   // ~2× size
+        const baseW = baseH * img.naturalWidth / img.naturalHeight;
+        const dy    = -baseH + s * 5;   // feet on ground tile
+
+        if (facing < 0) ctx.scale(-1, 1);
+        ctx.drawImage(img, -baseW / 2, dy, baseW, baseH);
+        ctx.restore();
+        return;
+      }
     }
+  }
 
+  // ── Icon sprite fallback ──────────────────────────────────
+  const sp = sprites[TROOP_SPRITE_KEY[def.id]];
+  if (sp && sp.complete && sp.naturalWidth > 0) {
     const baseH = s * 3.8;
     const baseW = baseH * sp.naturalWidth / sp.naturalHeight;
-    const dw = baseW * scX, dh = baseH * scY;
-    const dy = s * 0.3 - dh; // top-left Y: bottom of sprite at ground level
-
+    const dy    = s * 0.3 - baseH;
     if (facing < 0) ctx.scale(-1, 1);
-    ctx.drawImage(sp, -dw / 2, dy, dw, dh);
-
-    // Golden flash on attack
-    if (flash > 0) {
-      ctx.globalAlpha = Math.min(1, flash / 0.3) * 0.45;
-      ctx.fillStyle = '#ffe066';
-      ctx.fillRect(-dw / 2, dy, dw, dh);
-      ctx.globalAlpha = 1;
-    }
-    // Red flash on damage
-    if (dmgFlash > 0) {
-      ctx.globalAlpha = dmgFlash * 0.55;
-      ctx.fillStyle = '#ff3333';
-      ctx.fillRect(-dw / 2, dy, dw, dh);
-      ctx.globalAlpha = 1;
-    }
-  } else {
-    // ── Canvas fallback ───────────────────────────────────────
-    if (facing < 0) ctx.scale(-1, 1);
-    if      (def.id === 'barbarian') drawBarbarian(ctx, s, phase, state, flash);
-    else if (def.id === 'archer')    drawArcher(ctx, s, phase, state, flash);
-    else if (def.id === 'giant')     drawGiant(ctx, s, phase, state, flash);
+    ctx.drawImage(sp, -baseW / 2, dy, baseW, baseH);
+    ctx.restore();
+    return;
   }
+
+  // ── Canvas shape fallback ─────────────────────────────────
+  if (facing < 0) ctx.scale(-1, 1);
+  if      (def.id === 'barbarian') drawBarbarian(ctx, s, animTime, state, flash);
+  else if (def.id === 'archer')    drawArcher(ctx, s, animTime, state, flash);
+  else if (def.id === 'giant')     drawGiant(ctx, s, animTime, state, flash);
   ctx.restore();
 }
 
 function drawBarbarian(ctx, s, phase, state, flash) {
+  const ph = phase * 9;  // animTime→phase (9 rad/s ≈ 1.4 Hz walk cycle)
   const W = state === 'walk', A = state === 'attack';
-  const leg = W ? Math.sin(phase) * 0.45 : 0;
-  const arm = W ? Math.sin(phase + Math.PI) * 0.35 : A ? 0.5 + Math.sin(phase) * 0.7 : 0;
+  const leg = W ? Math.sin(ph) * 0.45 : 0;
+  const arm = W ? Math.sin(ph + Math.PI) * 0.35 : A ? 0.5 + Math.sin(ph) * 0.7 : 0;
   const skin  = flash > 0 ? '#fff' : '#e8a87c';
   const armor = flash > 0 ? '#fff' : '#7B3F00';
   // Back leg
@@ -1404,10 +1867,11 @@ function drawBarbarian(ctx, s, phase, state, flash) {
 }
 
 function drawArcher(ctx, s, phase, state, flash) {
+  const ph   = phase * 9;  // animTime→phase
   const W = state === 'walk', A = state === 'attack';
-  const leg  = W ? Math.sin(phase) * 0.42 : 0;
-  const armF = W ? Math.sin(phase + Math.PI) * 0.3 : 0;
-  const pull = A ? Math.min(1, Math.abs(Math.sin(phase)) * 1.2) : 0;
+  const leg  = W ? Math.sin(ph) * 0.42 : 0;
+  const armF = W ? Math.sin(ph + Math.PI) * 0.3 : 0;
+  const pull = A ? Math.min(1, Math.abs(Math.sin(ph)) * 1.2) : 0;
   const skin  = flash > 0 ? '#fff' : '#e8a87c';
   const shirt = flash > 0 ? '#fff' : '#1a6b1a';
   const BY = s * 0.12; // bow center Y (local coords)
@@ -1455,10 +1919,11 @@ function drawArcher(ctx, s, phase, state, flash) {
 }
 
 function drawGiant(ctx, s, phase, state, flash) {
+  const ph    = phase * 5;  // animTime→phase (5 rad/s = slower giant walk)
   const W = state === 'walk', A = state === 'attack';
-  const leg   = W ? Math.sin(phase) * 0.35 : 0;
-  const punchA = A ? Math.max(0, Math.sin(phase)) : 0;
-  const armSw  = W ? Math.sin(phase + Math.PI) * 0.28 : 0;
+  const leg   = W ? Math.sin(ph) * 0.35 : 0;
+  const punchA = A ? Math.max(0, Math.sin(ph)) : 0;
+  const armSw  = W ? Math.sin(ph + Math.PI) * 0.28 : 0;
   const armor = flash > 0 ? '#fff' : '#546E7A';
   const skin  = flash > 0 ? '#fff' : '#78909C';
   // Back leg
@@ -1574,7 +2039,7 @@ function drawWall(w) {
     ctx.closePath(); ctx.fillStyle = '#3a2560'; ctx.fill();
 
     // ── Crystal spikes ──────────────────────────────────────
-    const crH = ISO_TH * 3.2 * (0.55 + hpPct * 0.45);
+    const crH = ISO_TH * 1.6 * (0.55 + hpPct * 0.45);
     const crW = ISO_TW * 0.38;
     const spikes = [
       { dx:  0,              h: crH,        w: crW        },
@@ -1673,9 +2138,11 @@ window.addEventListener('load', () => {
     hoverRow = Math.floor(py / TILE);
   });
   canvas.addEventListener('mouseleave', () => { hoverCol = -1; hoverRow = -1; });
-  loadSprites(() => {
-    // Show start overlay with instructions already there
-  });
+  // Load static building sprites + defense building anims + troop animation frames
+  loadSprites(() => { /* static sprites ready — overlay is already shown */ });
+  loadTroopFrames(() => { /* troop frames ready before first battle starts */ });
+  loadBuildingFrames(() => { /* defense building frames ready */ });
+  loadVfxFrames(() => { /* vfx frames ready */ });
 });
 </script>
 </body>
